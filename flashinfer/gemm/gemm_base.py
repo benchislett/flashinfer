@@ -213,18 +213,23 @@ def get_gemm_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                # Must be synthesis-invariant: including a.shape (dynamic M)
-                # makes the runtime key miss the bucketed profile key, so the
-                # tuned tactic is dropped for tactic=-1. Shapes are already in
-                # the autotuner's input_shapes; add only dtypes.
-                a, b, _, _, out, _ = inputs
-                return (a.dtype, b.dtype, out.dtype)
+                # cuBLAS algorithm enumeration depends on the workspace budget.
+                # Keep M in input_shapes so bucketed profiling remains valid.
+                a, b, _, _, out, workspace = inputs
+                return (a.dtype, b.dtype, out.dtype, workspace.numel())
 
             def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
                 # Internal cuBLASLt algo-enumeration cache: this one is
                 # shape-specific, so key on full shapes (incl. M).
-                a, b, _, _, out, _ = inputs
-                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+                a, b, _, _, out, workspace = inputs
+                return (
+                    a.shape,
+                    b.shape,
+                    a.dtype,
+                    b.dtype,
+                    out.dtype,
+                    workspace.numel(),
+                )
 
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
@@ -8795,6 +8800,8 @@ def _cudnn_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     return _cudnn_available_or_raise_for_backend(backend)
 
@@ -8808,6 +8815,8 @@ def _cublas_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     return True
 
@@ -8821,6 +8830,8 @@ def _cutlass_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
@@ -8839,6 +8850,8 @@ def _cute_dsl_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     """Requirement check for CuTe-DSL FP8 BMM backend."""
     if not CUTE_DSL_AVAILABLE:
@@ -8876,6 +8889,8 @@ def _check_bmm_fp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     _validate_fp8_output_dtype(dtype)
     return True
@@ -8895,6 +8910,8 @@ def _heuristic_func_bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     # No e5m2 for cutlass (but cute-dsl supports it)
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -8972,6 +8989,8 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -8999,6 +9018,13 @@ def bmm_fp8(
         The backend to use for the operation. Defaults to ``"cublas"``.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
         ``"cute-dsl"`` uses CuTe-DSL kernels optimized for SM100+ (Blackwell/Rubin) architectures.
+
+    workspace_buffer: Optional[torch.Tensor]
+        Caller-owned scratch on the same device as ``A``, a contiguous 1D uint8
+        tensor with at least 40 MiB. If omitted, use the shared device cache.
+        Concurrent calls on different streams must supply separate workspaces.
+        Warm up before CUDA graph capture: backends may grow this tensor while
+        profiling. Retain the workspace for the lifetime of the captured graph.
 
     Returns
     -------
@@ -9037,9 +9063,21 @@ def bmm_fp8(
             dtype=dtype,
         )
 
-    workspace_buffer = _get_cache_buf(
-        "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
-    )
+    if workspace_buffer is None:
+        workspace_buffer = _get_cache_buf(
+            "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
+        )
+    elif (
+        workspace_buffer.device != A.device
+        or workspace_buffer.dtype != torch.uint8
+        or workspace_buffer.ndim != 1
+        or not workspace_buffer.is_contiguous()
+        or workspace_buffer.numel() < DEFAULT_WORKSPACE_SIZE
+    ):
+        raise ValueError(
+            "workspace_buffer must be a contiguous 1D uint8 tensor on A.device "
+            f"with at least {DEFAULT_WORKSPACE_SIZE} bytes"
+        )
 
     if backend == "auto":
         backends = bmm_fp8.suitable_auto_backends

@@ -184,3 +184,78 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+@pytest.mark.parametrize("workspace_bytes", [40 * 1024**2, 48 * 1024**2])
+def test_bmm_fp8_owned_workspace_concurrent_graph(workspace_bytes):
+    """Independent scratch remains correct across concurrent graph replays."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("This cuBLAS FP8 regression requires SM90+")
+    torch.manual_seed(13)
+    a = torch.randn(1, 24, 256, device="cuda").to(torch.float8_e4m3fn)
+    weights = [
+        torch.randn(1, n, 256, device="cuda").to(a.dtype).transpose(1, 2)
+        for n in (256, 64)
+    ]
+    scales = [torch.tensor(s, device="cuda") for s in (0.11, 0.23, 0.37)]
+    workspaces = [
+        torch.empty(workspace_bytes, device="cuda", dtype=torch.uint8) for _ in weights
+    ]
+    streams = [torch.cuda.Stream() for _ in weights]
+    outputs = [
+        torch.empty(1, 24, w.shape[-1], device="cuda", dtype=torch.bfloat16)
+        for w in weights
+    ]
+
+    def run(i):
+        bmm_fp8(
+            a,
+            weights[i],
+            scales[0],
+            scales[i + 1],
+            torch.bfloat16,
+            out=outputs[i],
+            backend="cublas",
+            workspace_buffer=workspaces[i],
+        )
+
+    for i, stream in enumerate(streams):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream), autotune(True, tuning_buckets=(24,)):
+            run(i)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.graph(graph, stream=streams[0]),
+        autotune(False, tuning_buckets=(24,)),
+    ):
+        streams[1].wait_stream(streams[0])
+        run(0)
+        with torch.cuda.stream(streams[1]):
+            run(1)
+        streams[0].wait_stream(streams[1])
+    for scale in (0.11, 0.19):
+        scales[0].fill_(scale)
+        a.copy_(torch.randn_like(a, dtype=torch.float32).to(a.dtype))
+        graph.replay()
+        for i, out in enumerate(outputs):
+            reference = (
+                torch.bmm(a.float(), weights[i].float()) * scales[0] * scales[i + 1]
+            )
+            torch.testing.assert_close(out.float(), reference, atol=0.01, rtol=0.01)
+
+
+def test_bmm_fp8_rejects_undersized_owned_workspace():
+    a = torch.zeros(1, 16, 256, device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.zeros(1, 64, 256, device="cuda", dtype=a.dtype).transpose(1, 2)
+    scale = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="workspace_buffer"):
+        bmm_fp8(
+            a,
+            b,
+            scale,
+            scale,
+            torch.bfloat16,
+            backend="cublas",
+            workspace_buffer=torch.empty(1024, device="cuda", dtype=torch.uint8),
+        )
